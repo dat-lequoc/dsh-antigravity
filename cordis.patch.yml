@@ -1,3 +1,10 @@
+- id: web
+  config:
+    searchProvider: antigravity
+
+- id: web-search-deepseek
+  disabled: true
+
 - insert:
     - id: dsh-antigravity
       name: dsh-antigravity

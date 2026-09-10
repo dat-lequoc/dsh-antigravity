@@ -65,7 +65,8 @@
     "@deepseek-ai/dsh-home-paths": "*",
     "@deepseek-ai/dsh-host-webserver": "*",
     "@deepseek-ai/dsh-llm": "*",
-    "@deepseek-ai/dsh-timeout": "*"
+    "@deepseek-ai/dsh-timeout": "*",
+    "@deepseek-ai/dsh-web": "*"
   },
   "peerDependenciesMeta": {
     "*": {
