@@ -21,7 +21,7 @@ talks to the Cloud Code Assist streaming API directly, and provides full bilingu
 ### Option 1: Direct from GitHub
 
 ```sh
-dsh plugin --profile web add github:LiZhenNet/dsh-antigravity
+dsh plugin --profile web add github:dat-lequoc/dsh-antigravity
 ```
 
 ### Option 2: From Local Release Tarball
@@ -33,6 +33,8 @@ dsh plugin --profile web add ./dist/dsh-antigravity-0.0.4.tgz
 
 The package declares a DSH bundle patch, so installation automatically mounts
 the host plugin and browser settings page.
+
+Search providers register through a Cordis context that injects `web`, whether the web service loads before or after this plugin. The model adapter requires only `llm`.
 
 If your DSH version does not support `dsh plugin add`, copy the package into
 the Web profile manually:

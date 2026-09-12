@@ -19,7 +19,7 @@
 ### 方式一：直接从 GitHub 安装
 
 ```sh
-dsh plugin --profile web add github:LiZhenNet/dsh-antigravity
+dsh plugin --profile web add github:dat-lequoc/dsh-antigravity
 ```
 
 ### 方式二：通过本地 Release 包安装
@@ -30,6 +30,8 @@ dsh plugin --profile web add ./dist/dsh-antigravity-0.0.4.tgz
 ```
 
 该 package 声明了 DSH bundle patch，安装后会自动挂载 host 插件与浏览器设置页面。
+
+无论 web 服务在本插件之前还是之后加载，搜索提供者都通过注入 `web` 的 Cordis 上下文注册。模型适配器仅依赖 `llm`。
 
 如果您的 DSH 版本暂不支持 `dsh plugin add`，可手动复制到 Web profile：
 
