@@ -6,7 +6,7 @@ process.env.ANTIGRAVITY_PROJECT_ID = 'aicode-consumers';
 process.env.ANTIGRAVITY_RETRY_INITIAL_DELAY_MS = '20';
 process.env.ANTIGRAVITY_RETRY_MAX_DELAY_MS = '50';
 
-const mod = await import('/tmp/agy-test/dsh-antigravity/lib/index.js');
+const mod = await import('./lib/index.js');
 
 const tests = [];
 function check(name, pass, detail = '') {
