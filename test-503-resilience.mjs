@@ -1,11 +1,12 @@
-// Comprehensive 503 Capacity Fault-Injection Test Suite
+// Test 503 retry without model fallback, keeping exact model and retrying with delay
 import fs from 'node:fs';
 
 process.env.ANTIGRAVITY_BASE_URL = 'https://cloudcode-pa.googleapis.com';
 process.env.ANTIGRAVITY_PROJECT_ID = 'aicode-consumers';
+process.env.ANTIGRAVITY_RETRY_INITIAL_DELAY_MS = '20';
+process.env.ANTIGRAVITY_RETRY_MAX_DELAY_MS = '50';
 
-// Import from worktree-test via symlinked node_modules
-const mod = await import('/home/nightfury/dsh-plugins/worktree-test/lib/index.js');
+const mod = await import('/tmp/agy-test/dsh-antigravity/lib/index.js');
 
 const tests = [];
 function check(name, pass, detail = '') {
@@ -24,7 +25,7 @@ const mockStore = {
 
 const mockSettings = {
   async read() {
-    return { enabledModelIds: ['gemini-3.8-flash-tiered', 'gemini-3.6-flash'], catalogModels: [] };
+    return { enabledModelIds: ['gemini-3.8-flash-tiered'], catalogModels: [] };
   }
 };
 
@@ -43,37 +44,39 @@ const ERROR_503_BODY = JSON.stringify({
   }
 });
 
-// ── Test 1: Transient 503 recovers on retry and shows error notice in stream ──
+// Test 1: 503 retries on the SAME model without model fallback
 {
-  console.log('Running Test 1: 503 retry recovery...');
+  console.log('Running Test 1: 503 retry without model fallback...');
   let callCount = 0;
+  const modelsRequested = [];
   globalThis.fetch = async (url, init) => {
     if (String(url).includes('fetchAvailableModels')) {
       return new Response(JSON.stringify({ models: [{ modelId: 'gemini-3.8-flash-tiered', supportsImages: true }] }), { status: 200 });
     }
     callCount++;
-    if (callCount <= 2) {
-      // Both endpoints fail on first candidate attempt
+    const body = init?.body ? JSON.parse(init.body) : {};
+    modelsRequested.push(body?.model);
+
+    if (callCount <= 4) {
+      // 503 on both endpoints for attempt 1 and attempt 2
       return new Response(ERROR_503_BODY, { status: 503, headers: { 'content-type': 'application/json' } });
     }
-    // Subsequent attempt recovers
-    return new Response(sseText('Recovered successfully after 503!'), {
+    // Attempt 3 succeeds on the exact same model
+    return new Response(sseText('Success on exact requested model!'), {
       status: 200,
       headers: { 'content-type': 'text/event-stream' }
     });
   };
 
   const adapter = new mod.AntigravityAdapter(mockStore, mockSettings, () => undefined);
-  const chunks = [];
   let fullText = '';
-  let notices = [];
+  const notices = [];
 
   for await (const chunk of adapter.stream({
     provider: 'antigravity',
     model: 'gemini-3.8-flash-tiered',
     messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }]
   })) {
-    chunks.push(chunk);
     if (chunk.type === 'reasoning-delta' && chunk.text.includes('Antigravity Notice:')) {
       notices.push(chunk.text);
     }
@@ -82,91 +85,21 @@ const ERROR_503_BODY = JSON.stringify({
     }
   }
 
-  check('1. Turn did not fail on 503', fullText === 'Recovered successfully after 503!', 'got: ' + fullText);
-  check('1. Transient notice was emitted to reasoning block', notices.length > 0, 'notices: ' + notices.length);
-  check('1. Notice mentions capacity/error', notices.some(n => n.includes('capacity') || n.includes('503') || n.includes('Notice:')));
-  check('1. Retried multiple calls', callCount >= 3, 'calls: ' + callCount);
+  check('1. Turn completed with success text', fullText === 'Success on exact requested model!', 'got: ' + fullText);
+  check('1. All requests were on gemini-3.8-flash-tiered (NO model fallback)', modelsRequested.every(m => m === 'gemini-3.8-flash-tiered'), 'models: ' + modelsRequested.join(', '));
+  check('1. Retried across multiple attempts', callCount > 2, 'calls: ' + callCount);
+  check('1. User saw waiting notices', notices.length >= 2, 'notices: ' + notices.length);
+  check('1. Notice mentions capacity and wait time', notices.some(n => n.includes('capacity') && n.includes('Waiting')));
 }
 
-// ── Test 2: 503 triggers fallback to next model candidate ──
+// Test 2: Instant cancellation during sleep
 {
-  console.log('Running Test 2: Model candidate fallback on capacity error...');
-  const modelsRequested = [];
-  globalThis.fetch = async (url, init) => {
-    if (String(url).includes('fetchAvailableModels')) {
-      return new Response(JSON.stringify({ models: [] }), { status: 200 });
-    }
-    const body = init?.body ? JSON.parse(init.body) : {};
-    const model = body?.model || 'unknown';
-    modelsRequested.push(model);
-
-    if (model.includes('3.8')) {
-      // Primary model 3.8 is overloaded (503)
-      return new Response(ERROR_503_BODY, { status: 503, headers: { 'content-type': 'application/json' } });
-    }
-    // Fallback model (e.g. 3.6) succeeds
-    return new Response(sseText('Hello from fallback model!'), {
-      status: 200,
-      headers: { 'content-type': 'text/event-stream' }
-    });
-  };
-
-  const adapter = new mod.AntigravityAdapter(mockStore, mockSettings, () => undefined);
-  let fullText = '';
-  let fallbackNotices = [];
-
-  for await (const chunk of adapter.stream({
-    provider: 'antigravity',
-    model: 'gemini-3.8-flash-tiered',
-    messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }]
-  })) {
-    if (chunk.type === 'reasoning-delta' && chunk.text.includes('fallback model')) {
-      fallbackNotices.push(chunk.text);
-    }
-    if (chunk.type === 'text-delta') {
-      fullText += chunk.text;
-    }
-  }
-
-  check('2. Fallback model succeeded', fullText === 'Hello from fallback model!', 'got: ' + fullText);
-  check('2. Switched from 3.8 to fallback candidate', modelsRequested.some(m => !m.includes('3.8')), 'models: ' + modelsRequested.join(', '));
-  check('2. Notice informed user about model switch', fallbackNotices.length > 0, 'notices: ' + fallbackNotices.length);
-}
-
-// ── Test 3: Persistent 503 across all retries throws terminal LlmError ──
-{
-  console.log('Running Test 3: Terminal 503 error after exhaustion...');
-  globalThis.fetch = async (url, init) => {
-    if (String(url).includes('fetchAvailableModels')) {
-      return new Response(JSON.stringify({ models: [] }), { status: 200 });
-    }
-    return new Response(ERROR_503_BODY, { status: 503, headers: { 'content-type': 'application/json' } });
-  };
-
-  const adapter = new mod.AntigravityAdapter(mockStore, mockSettings, () => undefined);
-  let error;
-  try {
-    for await (const chunk of adapter.stream({
-      provider: 'antigravity',
-      model: 'gemini-3.8-flash-tiered',
-      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }]
-    })) {}
-  } catch (e) {
-    error = e;
-  }
-
-  check('3. Throws terminal LlmError', !!error, 'no error thrown');
-  check('3. Error message contains 503 and diagnostic details', error?.message.includes('503') && error?.message.includes('capacity'), error?.message?.slice(0, 100));
-}
-
-// ── Test 4: AbortSignal cancellation during backoff ──
-{
-  console.log('Running Test 4: Cancellation during backoff...');
+  console.log('Running Test 2: Immediate abort during sleep...');
+  process.env.ANTIGRAVITY_RETRY_INITIAL_DELAY_MS = '60000'; // Set to 1 min
   globalThis.fetch = async () => new Response(ERROR_503_BODY, { status: 503, headers: { 'content-type': 'application/json' } });
 
   const controller = new AbortController();
   const adapter = new mod.AntigravityAdapter(mockStore, mockSettings, () => undefined);
-
   let abortedCleanly = false;
   const start = Date.now();
   try {
@@ -176,19 +109,41 @@ const ERROR_503_BODY = JSON.stringify({
       messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
       signal: controller.signal
     });
-    // Abort shortly after first 503 failure
-    setTimeout(() => controller.abort(), 80);
+    setTimeout(() => controller.abort(), 50);
     for await (const chunk of stream) {}
   } catch (e) {
     abortedCleanly = e?.code === 'ABORTED' || e?.message?.includes('aborted');
   }
   const duration = Date.now() - start;
 
-  check('4. Aborted cleanly without hanging in backoff', abortedCleanly);
-  check('4. Fast abort duration', duration < 2000, 'duration: ' + duration + 'ms');
+  check('2. Cancelled cleanly without waiting full 60s', abortedCleanly);
+  check('2. Fast cancellation duration', duration < 2000, 'duration: ' + duration + 'ms');
 }
 
-console.log('\n=== 503 Resilience Test Summary ===');
+// Test 3: Exhausted retries report clear error
+{
+  console.log('Running Test 3: Terminal error after max retries...');
+  process.env.ANTIGRAVITY_RETRY_INITIAL_DELAY_MS = '10';
+  process.env.ANTIGRAVITY_MAX_RETRIES = '3';
+  globalThis.fetch = async () => new Response(ERROR_503_BODY, { status: 503, headers: { 'content-type': 'application/json' } });
+
+  const adapter = new mod.AntigravityAdapter(mockStore, mockSettings, () => undefined);
+  let err;
+  try {
+    for await (const c of adapter.stream({
+      provider: 'antigravity',
+      model: 'gemini-3.8-flash-tiered',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }]
+    })) {}
+  } catch (e) {
+    err = e;
+  }
+
+  check('3. Throws terminal error after retries', !!err);
+  check('3. Terminal error mentions 503 and capacity', err?.message.includes('503') && err?.message.includes('capacity'));
+}
+
+console.log('\n=== Results ===');
 let pass = 0, fail = 0;
 for (const t of tests) {
   if (t.pass) pass++; else fail++;
