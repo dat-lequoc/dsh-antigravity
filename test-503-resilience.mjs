@@ -88,8 +88,7 @@ const ERROR_503_BODY = JSON.stringify({
   check('1. Turn completed with success text', fullText === 'Success on exact requested model!', 'got: ' + fullText);
   check('1. All requests were on gemini-3.8-flash-tiered (NO model fallback)', modelsRequested.every(m => m === 'gemini-3.8-flash-tiered'), 'models: ' + modelsRequested.join(', '));
   check('1. Retried across multiple attempts', callCount > 2, 'calls: ' + callCount);
-  check('1. User saw waiting notices', notices.length >= 2, 'notices: ' + notices.length);
-  check('1. Notice mentions capacity and wait time', notices.some(n => n.includes('capacity') && n.includes('Waiting')));
+  check('1. No retry diagnostics leaked into assistant output', notices.length === 0, 'notices: ' + notices.length);
 }
 
 // Test 2: Instant cancellation during sleep
