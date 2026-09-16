@@ -142,6 +142,20 @@ const ERROR_503_BODY = JSON.stringify({
   check('3. Terminal error mentions 503 and capacity', err?.message.includes('503') && err?.message.includes('capacity'));
 }
 
+// Network exceptions have no HTTP response, but must still enter the retry loop.
+{
+  let calls = 0;
+  globalThis.fetch = async () => {
+    if (++calls < 3) throw new TypeError('fetch failed', { cause: { code: 'ECONNRESET' } });
+    return new Response(sseText('Recovered'), { headers: { 'content-type': 'text/event-stream' } });
+  };
+  const adapter = new mod.AntigravityAdapter(mockStore, mockSettings, () => undefined);
+  const chunks = [];
+  for await (const chunk of adapter.stream({ provider: 'antigravity', model: 'gemini-3.8-flash-tiered', messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }] })) chunks.push(chunk);
+  check('4. Recovers from fetch failed after two network failures', calls === 3);
+  check('4. Network retries remain silent', !chunks.some(c => c.type === 'reasoning-delta'));
+}
+
 console.log('\n=== Results ===');
 let pass = 0, fail = 0;
 for (const t of tests) {
