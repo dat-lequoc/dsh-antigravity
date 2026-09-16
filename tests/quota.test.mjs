@@ -23,6 +23,11 @@ test("parses wrapped quota groups and preserves reset metadata", () => {
   assert.equal(quota.groups[0].buckets[0].resetTime, "2026-09-15T22:00:00Z");
 });
 
+test("preserves unknown remaining values instead of turning them into zero", () => {
+  const quota = parseQuotaSummary({ groups: [{ displayName: "Gemini", buckets: [{ bucketId: "unknown", resetTime: "later" }] }] });
+  assert.equal(quota.groups[0].buckets[0].remainingFraction, undefined);
+});
+
 test("accepts a flat bucket response and ignores empty groups", () => {
   const quota = parseQuotaSummary({
     buckets: [
