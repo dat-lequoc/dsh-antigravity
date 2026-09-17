@@ -117,3 +117,54 @@ test('batch callers are coalesced and queued work is awaited', () => {
   assert.match(source, /return quotaBatchPromise\.current \|\| Promise\.resolve\(false\)/);
   assert.match(source, /queuedQuotaBatch\.current/);
 });
+
+function renderQuotaRow(row) {
+  const start = source.indexOf('    function formatReset(');
+  const end = source.indexOf('    function QuotaGroup(', start);
+  assert.ok(start > 0 && end > start, 'quota row helpers not found in client source');
+  const createElement = (type, props, ...children) => ({ type, props: props || {}, children: children.flat() });
+  const React = { createElement };
+  const helpers = vm.runInNewContext(source.slice(start, end) + '\n({ QuotaRow })', {
+    React, createElement, Date, Number, String, Math, Object, Array, isNaN, parseInt,
+  });
+  const t = (key, params = {}) => {
+    const texts = {
+      resetPrefix: 'Refreshes in {time}', resetUnavailable: 'Refresh time unavailable',
+      resetNow: 'now', resetNowLabel: 'Refreshes now', remainingLabel: '{percent}% remaining',
+      notApplicable: 'N/A', notEnforced: 'Not currently enforced',
+    };
+    return Object.entries(params).reduce((s, [k, v]) => s.replaceAll(`{${k}}`, String(v)), texts[key] || key);
+  };
+  const tree = helpers.QuotaRow({ row, accent: 'cyan', t });
+  const classes = [];
+  const texts = [];
+  const walk = (node) => {
+    if (node === null || node === undefined || node === false) return;
+    if (Array.isArray(node)) return node.forEach(walk);
+    if (typeof node === 'object') {
+      if (node.props.className) classes.push(String(node.props.className));
+      walk(node.children);
+      return;
+    }
+    texts.push(String(node));
+  };
+  walk(tree);
+  return { classes, text: texts.join(' ') };
+}
+
+test('a non-enforced window renders as N/A instead of a live 100% bar', () => {
+  const disabled = renderQuotaRow({
+    label: 'Five Hour Limit Remaining', remainingFraction: 1, disabled: true,
+    description: 'You have hit your weekly limit, the 5-hour limit does not currently apply.',
+  });
+  assert.match(disabled.text, /N\/A/);
+  assert.match(disabled.text, /Not currently enforced/);
+  assert.match(disabled.text, /does not currently apply/);
+  assert.ok(!disabled.classes.some((c) => c.includes('dsha-bar')), 'disabled window must not draw a progress bar');
+
+  const live = renderQuotaRow({ label: 'Weekly Limit Remaining', remainingFraction: 0.105135344 });
+  assert.match(live.text, /10.51%/);
+  assert.match(live.text, /10% remaining/);
+  assert.ok(live.classes.some((c) => c.includes('dsha-bar')), 'live window must draw a progress bar');
+  assert.ok(!live.classes.some((c) => c.includes('dsha-row-off')));
+});

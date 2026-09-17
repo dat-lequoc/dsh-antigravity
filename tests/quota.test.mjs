@@ -28,6 +28,25 @@ test("preserves unknown remaining values instead of turning them into zero", () 
   assert.equal(quota.groups[0].buckets[0].remainingFraction, undefined);
 });
 
+test("carries Google's disabled flag and explanation for a non-enforced window", () => {
+  const quota = parseQuotaSummary({
+    groups: [{
+      displayName: "Claude and GPT models",
+      buckets: [{
+        bucketId: "3p-5h",
+        displayName: "Five Hour Limit Remaining",
+        remainingFraction: 1,
+        resetTime: "2026-09-17T16:15:25Z",
+        disabled: true,
+        description: "You have hit your weekly limit, the 5-hour limit does not currently apply.",
+      }],
+    }],
+  });
+  const bucket = quota.groups[0].buckets[0];
+  assert.equal(bucket.disabled, true);
+  assert.match(bucket.description, /does not currently apply/);
+});
+
 test("accepts a flat bucket response and ignores empty groups", () => {
   const quota = parseQuotaSummary({
     buckets: [
