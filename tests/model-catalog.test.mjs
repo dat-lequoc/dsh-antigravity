@@ -3,7 +3,7 @@
 // reported "sometimes Gemini 3.8 Flash is missing" symptom.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { catalogCacheKey, modelOptionsPayload } from '../lib/index.js';
+import { AntigravityAdapter, catalogCacheKey, modelOptionsPayload } from '../lib/index.js';
 
 const store = (over = {}) => ({
   path: () => '/tmp/antigravity-oauth.json',
@@ -60,4 +60,37 @@ test('the same enabled set keeps all three models once the catalog is loaded', (
     ],
   }, undefined).options.filter((option) => option.enabled).map((option) => option.id);
   assert.deepEqual(shown.sort(), ['gemini-3.1-flash-image', 'gemini-3.1-pro', 'gemini-3.8-flash-tiered']);
+});
+
+test('the picker keeps catalog-only models before this process fetches a catalog', async () => {
+  // An account-scoped store with nothing in the in-memory catalog: exactly the
+  // state right after a restart, when the picker used to show only the models in
+  // the static table. The persisted catalog is the correct fallback.
+  const accountStore = {
+    accountId: 'account-a',
+    path: () => '/tmp/antigravity-oauth.json',
+    read: async () => ({
+      access: 'token',
+      refresh: 'refresh',
+      expires: Date.now() + 3600e3,
+    }),
+  };
+  const modelSettings = {
+    read: async () => ({
+      enabledModelIds: ['gemini-3.1-flash-image', 'gemini-3.8-flash-tiered', 'gemini-3.1-pro'],
+      catalogModels: [
+        { id: 'gemini-3.8-flash-tiered', name: 'Gemini 3.8 Flash Tiered', inputModalities: ['text'], reasoningEfforts: ['low', 'medium', 'high'], contextWindow: 1048576, maxTokens: 65536 },
+        { id: 'gemini-3.1-pro', name: 'Gemini 3.1 Pro', inputModalities: ['text'], reasoningEfforts: ['low', 'high'], contextWindow: 1048576, maxTokens: 65536 },
+        { id: 'gemini-3.1-flash-image', name: 'Gemini 3.1 Flash Image', inputModalities: ['text', 'image'], reasoningEfforts: [], contextWindow: 1048576, maxTokens: 65536 },
+      ],
+    }),
+    setCatalogModels: async () => {},
+  };
+
+  const adapter = new AntigravityAdapter(accountStore, modelSettings, () => undefined);
+  const models = await adapter.listModels('antigravity');
+  assert.deepEqual(
+    models.map((model) => model.id).sort(),
+    ['gemini-3.1-flash-image', 'gemini-3.1-pro', 'gemini-3.8-flash-tiered'],
+  );
 });
