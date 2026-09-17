@@ -1,6 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseQuotaSummary } from "../lib/index.js";
+import { parseQuotaSummary, quotaEndpointCandidates } from "../lib/index.js";
+
+test("quota prefers the endpoint the Antigravity client reads", () => {
+  // The production endpoint can serve a lagging Gemini snapshot; the daily endpoint
+  // matched the Antigravity client's reported percentages and reset timestamps.
+  const candidates = quotaEndpointCandidates();
+  assert.equal(candidates[0], "https://daily-cloudcode-pa.sandbox.googleapis.com");
+  assert.ok(candidates.includes("https://cloudcode-pa.googleapis.com"), "production endpoint stays as fallback");
+  assert.equal(new Set(candidates).size, candidates.length, "no duplicate endpoints");
+});
 
 test("parses wrapped quota groups and preserves reset metadata", () => {
   const quota = parseQuotaSummary({
