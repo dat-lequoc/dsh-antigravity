@@ -1,0 +1,63 @@
+// The picker's model list is the fetched account catalog. Losing that cache falls
+// back to the static MODELS table, which silently hides catalog-only models — the
+// reported "sometimes Gemini 3.8 Flash is missing" symptom.
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { catalogCacheKey, modelOptionsPayload } from '../lib/index.js';
+
+const store = (over = {}) => ({
+  path: () => '/tmp/antigravity-oauth.json',
+  accountId: 'account-a',
+  credentialRevision: 1,
+  proxy: { revision: 0 },
+  ...over,
+});
+
+test('the model catalog survives an on-demand token refresh', () => {
+  // A refresh bumps credentialRevision; the catalog must not be orphaned by it.
+  assert.equal(
+    catalogCacheKey(store({ credentialRevision: 9 })),
+    catalogCacheKey(store({ credentialRevision: 1 })),
+  );
+});
+
+test('a proxy edit does not orphan the catalog either', () => {
+  assert.equal(catalogCacheKey(store({ proxy: { revision: 4 } })), catalogCacheKey(store()));
+});
+
+test('the catalog stays separate per account and per credential file', () => {
+  assert.notEqual(catalogCacheKey(store()), catalogCacheKey(store({ accountId: 'account-b' })));
+  assert.notEqual(catalogCacheKey(store()), catalogCacheKey(store({ path: () => '/tmp/other.json' })));
+  assert.notEqual(catalogCacheKey(store()), catalogCacheKey(undefined));
+});
+
+test('an enabled catalog-only model is offered while the catalog is loaded', () => {
+  const options = modelOptionsPayload({
+    enabledModelIds: ['gemini-3.8-flash-tiered'],
+    catalogModels: [{ id: 'gemini-3.8-flash-tiered', name: 'Gemini 3.8 Flash Tiered' }],
+  }, undefined);
+  assert.equal(options.options.find((option) => option.id === 'gemini-3.8-flash-tiered')?.enabled, true);
+});
+
+test('the static fallback reproduces the reported missing-model symptom', () => {
+  // This is the failure mode the cache-key fix prevents. With the real enabled
+  // set and no catalog, the two static bases survive and 3.8 disappears — the
+  // exact picker contents from the report.
+  const shown = modelOptionsPayload({
+    enabledModelIds: ['gemini-3.1-flash-image', 'gemini-3.8-flash-tiered', 'gemini-3.1-pro'],
+    catalogModels: [],
+  }, undefined).options.filter((option) => option.enabled).map((option) => option.id);
+  assert.deepEqual(shown.sort(), ['gemini-3.1-flash-image', 'gemini-3.1-pro']);
+});
+
+test('the same enabled set keeps all three models once the catalog is loaded', () => {
+  const shown = modelOptionsPayload({
+    enabledModelIds: ['gemini-3.1-flash-image', 'gemini-3.8-flash-tiered', 'gemini-3.1-pro'],
+    catalogModels: [
+      { id: 'gemini-3.1-flash-image', name: 'Gemini 3.1 Flash Image' },
+      { id: 'gemini-3.8-flash-tiered', name: 'Gemini 3.8 Flash Tiered' },
+      { id: 'gemini-3.1-pro', name: 'Gemini 3.1 Pro' },
+    ],
+  }, undefined).options.filter((option) => option.enabled).map((option) => option.id);
+  assert.deepEqual(shown.sort(), ['gemini-3.1-flash-image', 'gemini-3.1-pro', 'gemini-3.8-flash-tiered']);
+});
