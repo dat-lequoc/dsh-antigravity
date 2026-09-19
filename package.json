@@ -16,6 +16,8 @@
     },
     "client": {
       "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-model-selection",
         "@deepseek-ai/dsh-client-ui-settings",
         "@deepseek-ai/dsh-client-locale"
       ],
@@ -62,6 +64,8 @@
     "url": "https://github.com/LiZhenNet/dsh-antigravity/issues"
   },
   "peerDependencies": {
+    "@deepseek-ai/dsh-client-ui-conversation": "*",
+    "@deepseek-ai/dsh-client-ui-model-selection": "*",
     "@deepseek-ai/dsh-home-paths": "*",
     "@deepseek-ai/dsh-host-webserver": "*",
     "@deepseek-ai/dsh-llm": "*",
