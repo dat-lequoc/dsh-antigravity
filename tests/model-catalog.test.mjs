@@ -93,4 +93,41 @@ test('the picker keeps catalog-only models before this process fetches a catalog
     models.map((model) => model.id).sort(),
     ['gemini-3.1-flash-image', 'gemini-3.1-pro', 'gemini-3.8-flash-tiered'],
   );
+
+  const flash38 = models.find((m) => m.id === 'gemini-3.8-flash-tiered');
+  assert.equal(flash38?.reasoning?.defaultEffort, 'high');
+
+  const pro31 = models.find((m) => m.id === 'gemini-3.1-pro');
+  assert.equal(pro31?.reasoning?.defaultEffort, 'high');
+
+  const flashImg = models.find((m) => m.id === 'gemini-3.1-flash-image');
+  assert.equal(flashImg?.reasoning, undefined);
+
+  const resolved = await adapter.resolveModel('antigravity', 'gemini-3.8-flash-tiered');
+  assert.equal(resolved.reasoning?.defaultEffort, 'high');
+});
+
+test('static models declare high default reasoning when high is supported, or max available', async () => {
+  const accountStore = {
+    accountId: 'account-a',
+    path: () => '/tmp/antigravity-oauth.json',
+    read: async () => ({ access: 'token' }),
+  };
+  const modelSettings = {
+    read: async () => ({
+      enabledModelIds: ['gemini-3.7-flash', 'gpt-oss-120b', 'claude-opus-4-6'],
+      catalogModels: [],
+    }),
+    setCatalogModels: async () => {},
+  };
+
+  const adapter = new AntigravityAdapter(accountStore, modelSettings, () => undefined);
+  const gemini37 = await adapter.resolveModel('antigravity', 'gemini-3.7-flash');
+  assert.equal(gemini37.reasoning?.defaultEffort, 'high');
+
+  const gptOss = await adapter.resolveModel('antigravity', 'gpt-oss-120b');
+  assert.equal(gptOss.reasoning?.defaultEffort, 'medium');
+
+  const claudeOpus = await adapter.resolveModel('antigravity', 'claude-opus-4-6');
+  assert.equal(claudeOpus.reasoning?.defaultEffort, 'high');
 });
