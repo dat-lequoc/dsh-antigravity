@@ -94,6 +94,7 @@ $DSH_HOME/storages/antigravity-oauth.json
 
 | 模型 ID | 名称 | 额度池 |
 |---|---|---|
+| `gemini-4-argon` | Gemini 4 Argon | Gemini |
 | `gemini-3.7-flash` | Gemini 3.7 Flash | Gemini |
 | `gemini-3.6-flash` | Gemini 3.6 Flash | Gemini |
 | `gemini-3.5-flash` | Gemini 3.5 Flash | Gemini |
@@ -102,6 +103,8 @@ $DSH_HOME/storages/antigravity-oauth.json
 | `gemini-3-flash` | Gemini 3 Flash | Gemini |
 | `gemini-2.5-pro` | Gemini 2.5 Pro | Gemini |
 | `gemini-2.5-flash` | Gemini 2.5 Flash | Gemini |
+| `claude-opus-5.5` | Claude Opus 5.5 | Claude & GPT (3P) |
+| `claude-sonnet-5.5` | Claude Sonnet 5.5 | Claude & GPT (3P) |
 | `claude-opus-4-6` | Claude Opus 4.6 | Claude & GPT (3P) |
 | `claude-sonnet-4-6` | Claude Sonnet 4.6 | Claude & GPT (3P) |
 | `gpt-oss-120b` | GPT-OSS 120B | Claude & GPT (3P) |
@@ -109,6 +112,25 @@ $DSH_HOME/storages/antigravity-oauth.json
 同一额度池内的模型共享 5 小时与每周额度。额度按 Token 成本比例扣除，因此较重的大模型（如 Claude Opus）消耗额度速度会快于轻量模型。
 
 插件会在可用时通过实时的 `fetchAvailableModels` 目录将这些公开 ID 解析为内部运行时模型 ID，并自带静态路由兜底。
+
+`gemini-4-argon` 通过模型选择器指定推理等级，实际向上游发送
+`gemini-4-argon-low`、`gemini-4-argon-medium` 或 `gemini-4-argon-high`。上游仅提供这些固定等级 ID，不接受裸 ID
+`gemini-4-argon`，因此选择器中的单个条目会按等级路由。
+
+服务端会根据 `User-Agent` 中的客户端标识来决定模型可用性。请求会以
+`antigravity/cli/<version>` 标识自身；缺少其中的 `cli` 段时，模型目录不再包含 Argon 各等级且相关请求会被拒绝，完全不发送
+`User-Agent` 则会被直接拒绝。可通过 `ANTIGRAVITY_USER_AGENT` 覆盖默认值。
+
+## Token 用量
+
+额度面板还会显示本机已消耗的 Token 数。服务端仅以剩余比例的形式提供额度
+（`retrieveUserQuotaSummary`、`retrieveUserQuota`），并不提供 Token 总量，因此插件改为统计每个已完成请求返回的
+`usageMetadata`，按账号累计写入 `$DSH_HOME/storages/antigravity-usage.json`
+（权限 `0600`，每日明细保留 60 天）。
+
+该数据仅涵盖经本插件发出的请求，不包含 Antigravity CLI、IDE 或其他 DSH profile
+的流量，因此面板将该区块标注为「已用 Token（本机统计）」，而不将其呈现为账号级总量。缓存命中的输入
+Token 单独统计、不会在总量中重复计算；推理 Token 计入输出。未上报 usage 元数据的流不会计为一次请求。
 
 ---
 

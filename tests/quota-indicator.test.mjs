@@ -57,16 +57,29 @@ test('isAntigravityModel validates active provider and model readiness', () => {
     current: { provider: 'antigravity', model: 'claude-sonnet-4-6' }
   }), true);
 
-  // Other providers or non-ready states must return false
+  // Other providers must return false
   assert.equal(isAntigravityModel({
     status: 'ready',
     current: { provider: 'openai-codex', model: 'gpt-5' }
   }), false);
 
+  // A transient catalog reload (status "loading", routable null) must NOT hide
+  // the chip: every /quota call re-emits llm/adapters-updated, which restarts
+  // the shared model catalog while the selection stays Antigravity.
   assert.equal(isAntigravityModel({
     status: 'loading',
+    routable: null,
     current: { provider: 'antigravity', model: 'gemini-3.7-flash' }
-  }), false);
+  }), true);
+
+  assert.equal(isAntigravityModel({
+    status: 'selecting',
+    current: { provider: 'antigravity', model: 'gemini-3.7-flash' }
+  }), true);
+
+  // No resolved selection yet: nothing to show.
+  assert.equal(isAntigravityModel({ status: 'loading', current: null }), false);
+  assert.equal(isAntigravityModel({ status: 'ready', current: { provider: 'antigravity' } }), false);
 
   assert.equal(isAntigravityModel(undefined), false);
 });
