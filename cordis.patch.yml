@@ -1,6 +1,11 @@
+# A Cordis config override replaces the complete entry config, so keep the
+# base bundle's `fetchProvider: http` here. Omitting it leaves fetch selection
+# unset and, with both web-fetch-http and web-deepseek-api mounted, every fetch
+# fails with WEB_PROVIDER_AMBIGUOUS.
 - id: web
   config:
     searchProvider: antigravity
+    fetchProvider: http
 
 - id: web-search-deepseek
   disabled: true

@@ -209,3 +209,52 @@ test('real Undici CONNECT forwarder carries response body without external acces
     await Promise.all([target, proxy].map(server => new Promise(resolve => server.close(resolve))));
   }
 });
+
+test('all-account scope (the value the store and UI save) actually proxies API calls', async () => {
+  // Regression: account-store.js validates 'all-account' and the settings UI saves
+  // exactly that, while the transport accepted only 'all'. Choosing "All account
+  // traffic" therefore stored a scope this layer rejected, and every covered call
+  // failed with "Account proxy is unavailable." instead of being proxied. Both
+  // spellings must now select the account proxy.
+  const calls = recordFetch();
+  for (const scope of ['all-account', 'all']) {
+    await runWithTransport(context(scope, 'api'), async () => {
+      assert.equal(await (await providerFetch('https://example.test')).text(), 'ok');
+    });
+  }
+  assert.equal(calls.length, 2);
+  assert.ok(
+    calls.every(call => Object.hasOwn(call.init, 'dispatcher')),
+    'both scope spellings must route through an account proxy dispatcher',
+  );
+
+  // auth-only keeps its documented exemption for model/API traffic.
+  const exempt = recordFetch();
+  await runWithTransport(context('auth-only', 'api'), async () => {
+    await (await providerFetch('https://example.test')).text();
+  });
+  assert.ok(!Object.hasOwn(exempt[0].init, 'dispatcher'), 'auth-only must not proxy API calls');
+});
+
+test('proxy failures name the cause without leaking the proxy origin', async () => {
+  // Regression: every proxied failure used to surface as the bare
+  // "Account proxy is unavailable.", so an unreachable tunnel could not be told
+  // apart from a stream reset or a bug here. The detail must stay useful without
+  // echoing the account's proxy address.
+  globalThis.fetch = undici.fetch = async () => {
+    throw Object.assign(
+      new Error('secret-token http://secret-proxy 127.0.0.1:12345'),
+      { code: 'ECONNREFUSED' },
+    );
+  };
+  await assert.rejects(
+    () => runWithTransport(context('all-account', 'api'), () => providerFetch('https://example.test')),
+    (error) => {
+      assert.equal(error.code, 'PROXY_UNAVAILABLE');
+      assert.match(error.message, /ECONNREFUSED/, 'the structured cause must be reported');
+      assert.ok(!error.message.includes('secret-token'), 'raw upstream text must not leak');
+      assert.ok(!error.message.includes('127.0.0.1:12345'), `the proxy address must not leak: ${error.message}`);
+      return true;
+    },
+  );
+});

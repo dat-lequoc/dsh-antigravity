@@ -89,6 +89,30 @@ $DSH_HOME/storages/antigravity-oauth.json
 
 Keep that file private. It contains access and refresh tokens.
 
+### Swapping the Antigravity CLI auth
+
+The `agy` CLI keeps its own session, separate from this plugin's store. To move it
+onto an account the plugin already holds — without signing in again — run the
+helper from this package:
+
+```sh
+node bin/antigravity-cli-auth.mjs list              # CLI identity + candidates
+node bin/antigravity-cli-auth.mjs use quoccbaoo     # swap, then probe with `agy models`
+node bin/antigravity-cli-auth.mjs restore           # undo the last swap
+```
+
+`use` matches any unique part of an account's id, email or label, mints a fresh
+access token from that account's refresh token (the token endpoint is also what
+returns a matching `id_token`), backs the previous CLI token up beside itself, and
+writes the new one atomically with mode `600`. The refresh token is reused
+unchanged, so the account keeps working in DSH afterwards. Candidates come from
+the plugin store by default; pass `--source sub2api` to read sub2api's database
+instead, or `--no-probe` to skip the `agy models` check.
+
+Both the plugin and the CLI end up refreshing the same Google account, which is
+fine for this client, but if either reports needing sign-in again, run `list` to
+see which identity each one holds.
+
 ## Models
 
 After login, select the **Antigravity** provider in DSH's model picker. Use the

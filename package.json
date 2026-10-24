@@ -38,7 +38,8 @@
   },
   "scripts": {
     "test": "node --test tests/*.test.mjs",
-    "check": "npm test && node --check lib/index.js && node --check lib/client.js && node --check bin/antigravity-login.mjs",
+    "check": "npm test && node --check lib/index.js && node --check lib/client.js && node --check bin/antigravity-login.mjs && node --check bin/antigravity-cli-auth.mjs",
+    "account": "node bin/antigravity-cli-auth.mjs",
     "pack:dist": "mkdir -p dist && npm pack --pack-destination dist"
   },
   "engines": {
@@ -77,5 +78,8 @@
     "*": {
       "optional": true
     }
+  },
+  "dependencies": {
+    "undici": "^7.29.1"
   }
 }
