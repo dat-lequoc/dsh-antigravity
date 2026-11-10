@@ -84,6 +84,22 @@ $DSH_HOME/storages/antigravity-oauth.json
 
 > 请妥善保管该文件，其中包含 access token 与 refresh token。
 
+### 切换 Antigravity CLI 授权
+
+`agy` CLI 使用独立的会话文件 `~/.gemini/antigravity-cli/antigravity-oauth-token`，与本插件的账号存储、以及 DSH 当前启用的账号都不相同。
+
+**在设置页操作。** 每个账号行都提供 **用作 AGY CLI**，它只把该账号已保存的凭据写入 CLI 的会话文件，不会改变 DSH 用于模型调用的账号。当前占据 CLI 会话的账号行会标记为 **AGY CLI**，卡片顶部也会显示 `agy` 当前登录的地址。替换前，仅当旧会话的地址不属于任何已保存账号时，才会备份为 `antigravity-oauth-token.bak-<时间戳>`：已保存的账号随时可以重新写入，而外部登录一旦覆盖就找不回来。access token 过期时会先按该账号自身的路由刷新；若刷新失败，仍会写入已保存的凭据，因为 CLI 持有同一个 refresh token，可自行刷新。
+
+**在终端操作。** 如需把 CLI 切到插件已保存的账号，可运行同包内的辅助脚本：
+
+```sh
+node bin/antigravity-cli-auth.mjs list              # CLI 身份与候选账号
+node bin/antigravity-cli-auth.mjs use quoccbaoo     # 切换后用 `agy models` 验证
+node bin/antigravity-cli-auth.mjs restore           # 撤销上一次切换
+```
+
+`use` 会按账号 id、邮箱或标签的唯一片段匹配，用该账号的 refresh token 换取新的 access token，把原 CLI token 备份到同目录，并以 `600` 权限原子写入。refresh token 原样复用，因此该账号在 DSH 中仍可继续使用；候选账号默认来自插件存储，可加 `--source sub2api` 改为读取 sub2api 数据库，或加 `--no-probe` 跳过 `agy models` 校验。
+
 ---
 
 ## 模型列表
@@ -120,6 +136,65 @@ $DSH_HOME/storages/antigravity-oauth.json
 服务端会根据 `User-Agent` 中的客户端标识来决定模型可用性。请求会以
 `antigravity/cli/<version>` 标识自身；缺少其中的 `cli` 段时，模型目录不再包含 Argon 各等级且相关请求会被拒绝，完全不发送
 `User-Agent` 则会被直接拒绝。可通过 `ANTIGRAVITY_USER_AGENT` 覆盖默认值。
+
+## 按会话选择账号
+
+插件级的「当前账号」是所有会话的默认值。单个会话可以固定使用自己的账号，从而让并行的会话消耗不同账号。
+
+输入框工具行中有一个标签：显示 **跟随当前** 表示使用插件级账号，显示账号名表示本会话固定在该账号。
+点击可选择「跟随当前账号」或任一已登录账号；该选择只作用于本会话，并在下一次请求时生效。
+
+同样可以在对话中切换：
+
+```
+/antigravity-account            # 列出账号，并标注当前账号与本会话使用的账号
+/antigravity-account bop        # 也可用 #2、邮箱或账号 id
+/antigravity-account active     # 恢复跟随当前账号
+```
+
+访问令牌已过期的账号仍可选择：存储的刷新令牌会在下一次请求时自动续期，设置页与选择器
+因此都将该状态视为可用。
+
+固定关系保存在 `$DSH_HOME/storages/antigravity-sessions.json`（权限 `0600`，保留最近
+500 个会话、90 天）。子代理与会话分叉会继承最近的已固定祖先会话，因此委派出去的任务
+使用其父会话选定的账号。
+
+模型选择器仍以「当前账号」为准，因为 `listModels`/`resolveModel` 是 provider 级别的；
+输入框旁的额度条则跟随本会话，显示该会话实际消耗的额度与 Token。会话使用的账号也可用该命令查询。
+
+当某个请求所使用的账号报告额度耗尽时，该请求会在下一个已登录账号上重试（若仍耗尽
+则继续尝试下一个），并把会话的固定关系迁移到成功的账号，后续步骤从那里继续。已固定的会话只会在自己的账号
+耗尽后才迁移；已经产生内容的请求不会在别的账号上重放。可在 `cordis.patch.yml` 的
+`dsh-antigravity` 行设置 `failoverOnQuota: false` 关闭该行为。
+
+## 上下文窗口
+
+每个模型上报其目录声明的容量：Gemini 系列为 1,048,576 Token，Claude 系列为
+250,000 或 200,000。DSH 会在对话接近该容量时压缩（compaction-basic 的
+`thresholdRatio` 默认 0.8，并先扣除补全预算与 65,536 Token 的 headroom）。因此
+1M 窗口会让会话增长到约 839k Token 才被总结，而这一区间内的每次请求都会计入账号的
+Token 额度。
+
+`maxContextWindow` 限制适配器上报的容量。它只会下调、不会上调，因此 Claude 模型
+保留各自更小的窗口：
+
+```yaml
+- id: dsh-antigravity
+  config:
+    maxContextWindow: 750000
+```
+
+设置该值后压缩会更早发生：窗口上报为 750,000，触发点为 600,000 Token，压缩后保留
+约 110k。想更省额度就调低，想保留更多历史就调高或删除该字段：
+
+| 上报窗口 | 触发压缩 | 压缩后保留 |
+|---|---|---|
+| 1,048,576（目录值） | 838,860 | 约 157k |
+| 750,000 | 600,000 | 约 110k |
+| 600,000 | 468,928 | 约 86k |
+
+该上限适用于本 provider 的全部模型，以及使用它的子代理。修改后由 profile 监听器
+重载 provider 条目，无需重启进程。
 
 ## Token 用量
 

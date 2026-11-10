@@ -91,9 +91,24 @@ Keep that file private. It contains access and refresh tokens.
 
 ### Swapping the Antigravity CLI auth
 
-The `agy` CLI keeps its own session, separate from this plugin's store. To move it
-onto an account the plugin already holds — without signing in again — run the
-helper from this package:
+The `agy` CLI keeps its own session at
+`~/.gemini/antigravity-cli/antigravity-oauth-token`, separate from this plugin's
+store and from the account DSH itself uses.
+
+**From the settings page.** Every account row has **Use in AGY CLI**, which
+writes that account's saved credentials to the CLI's token file without making it
+the account DSH uses for model calls. The row that currently holds the CLI
+session is marked **AGY CLI**, and a note at the top of the card names the address
+`agy` is signed in as. The previous session is backed up to
+`antigravity-oauth-token.bak-<timestamp>` only when its address is not one of the
+saved accounts: a saved account can be written back at any time, whereas an
+outside login would otherwise be lost. An expired access token is refreshed
+through the account's own route first; if that refresh fails the stored pair is
+written anyway, because the CLI holds the same refresh token and can refresh it
+itself.
+
+**From a terminal.** To move the CLI onto an account the plugin already holds —
+without signing in again — run the helper from this package:
 
 ```sh
 node bin/antigravity-cli-auth.mjs list              # CLI identity + candidates
@@ -156,6 +171,79 @@ Requests identify as `antigravity/cli/<version>`; without that `cli` segment the
 Argon tiers are missing from the model catalog and every request for them is
 refused, and sending no `User-Agent` at all is refused outright. Set
 `ANTIGRAVITY_USER_AGENT` to override the default.
+
+## Accounts per session
+
+The active account is the default for every session. One session can pin its own
+account instead, so concurrent sessions spend different accounts.
+
+In the composer tool row a chip shows **Active** (following the profile-wide
+account) or the account this session pinned. Clicking it offers "Follow active
+account" and every signed-in account; the choice applies to this session only and
+takes effect on its next request.
+
+The same choice is available from the chat:
+
+```
+/antigravity-account            # list accounts; mark the active one and this session's
+/antigravity-account bop        # or #2, an email address, or an account id
+/antigravity-account active     # follow the active account again
+```
+
+An account whose access token expired is still selectable: its stored refresh
+token renews it on the next request, which is why the settings page and the
+picker both treat it as ready.
+
+Pins live in `$DSH_HOME/storages/antigravity-sessions.json` (mode `0600`, newest
+500 sessions, 90-day retention). Subagent and forked sessions inherit the nearest
+pinned ancestor, so a delegated task spends the account its parent chose.
+
+The model picker stays on the active account because `listModels`/`resolveModel`
+are provider-wide; the composer's quota meter follows the session instead, so
+its bars and token counts describe what this session is spending. The command
+reports the account either way.
+
+When the account a request uses reports quota exhaustion, the request is retried
+on the next signed-in account (and the one after that, if it too is exhausted),
+and the session's pin moves to the account that worked, so the following steps
+start there. A pinned session only moves
+after its own account is exhausted, and a request that already produced content
+is never replayed elsewhere. Disable the behavior with `failoverOnQuota: false`
+on the `dsh-antigravity` row of `cordis.patch.yml`.
+
+## Context window
+
+Each model reports the capacity its catalog advertises: 1,048,576 tokens for the
+Gemini families, 250,000 or 200,000 for the Claude ones. DSH condenses the
+conversation as it approaches that capacity (compaction-basic's `thresholdRatio`,
+0.8 by default, after reserving the completion budget and its 65,536-token
+headroom). A 1M window therefore lets a session grow to roughly 839k tokens
+before it is summarized, and every request in that range is billed against the
+account's token quota.
+
+`maxContextWindow` caps what the adapter reports. It only lowers a model's
+capacity, never raises it, so the Claude models keep their own smaller windows:
+
+```yaml
+- id: dsh-antigravity
+  config:
+    maxContextWindow: 750000
+```
+
+With that cap the harness condenses earlier: 750,000 is reported as the window
+and the trigger lands at exactly 600,000 tokens, keeping roughly 110k after
+summarization. Lower the value to spend less quota on long sessions; raise it or
+remove the field to keep more history:
+
+| Reported window | Condenses at | Kept after |
+|---|---|---|
+| 1,048,576 (catalog) | 838,860 | ~157k |
+| 750,000 | 600,000 | ~110k |
+| 600,000 | 468,928 | ~86k |
+
+The cap applies to every model this provider serves and to subagents using it.
+Changing it reloads the provider entry through the profile watcher; no process
+restart is needed.
 
 ## Token usage
 

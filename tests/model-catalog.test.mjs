@@ -3,7 +3,7 @@
 // reported "sometimes Gemini 3.8 Flash is missing" symptom.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { AntigravityAdapter, catalogCacheKey, modelOptionsPayload } from '../lib/index.js';
+import { AntigravityAdapter, catalogCacheKey, contextCapacity, modelOptionsPayload } from '../lib/index.js';
 
 const store = (over = {}) => ({
   path: () => '/tmp/antigravity-oauth.json',
@@ -369,4 +369,51 @@ test('requests identify as the Antigravity CLI client', async () => {
   for (const ua of userAgents) {
     assert.match(ua, /^antigravity\/cli\//, `User-Agent lost the CLI segment: ${ua}`);
   }
+});
+
+test('maxContextWindow caps every reported context window and never raises one', async () => {
+  const accountStore = {
+    accountId: 'account-a',
+    path: () => '/tmp/antigravity-oauth.json',
+    read: async () => ({ access: 'token' }),
+  };
+  const modelSettings = {
+    read: async () => ({ enabledModelIds: ['gemini-4-argon', 'claude-opus-5.5'], catalogModels: [] }),
+  };
+  const adapter = new AntigravityAdapter(accountStore, modelSettings, () => undefined, undefined, {
+    maxContextWindow: 750000,
+  });
+
+  const models = await adapter.listModels('antigravity');
+  // The Gemini window is lowered, so compaction-basic budgets its pressure from
+  // 750,000 instead of 1,048,576 and condenses at 0.8 of the cap.
+  assert.equal(models.find((model) => model.id === 'gemini-4-argon').context.contextWindow, 750000);
+  // A model already below the cap keeps its own, smaller window.
+  assert.equal(models.find((model) => model.id === 'claude-opus-5.5').context.contextWindow, 250000);
+
+  const resolved = await adapter.resolveModel('antigravity', 'gemini-4-argon');
+  assert.equal(resolved.context.contextWindow, 750000);
+});
+
+test('an unset cap reports the catalog capacity unchanged', async () => {
+  const accountStore = {
+    accountId: 'account-a',
+    path: () => '/tmp/antigravity-oauth.json',
+    read: async () => ({ access: 'token' }),
+  };
+  const modelSettings = { read: async () => ({ enabledModelIds: ['gemini-4-argon'], catalogModels: [] }) };
+  const adapter = new AntigravityAdapter(accountStore, modelSettings, () => undefined);
+
+  const resolved = await adapter.resolveModel('antigravity', 'gemini-4-argon');
+  assert.equal(resolved.context.contextWindow, 1048576);
+});
+
+test('contextCapacity only lowers a window and ignores unusable caps', () => {
+  assert.equal(contextCapacity(1048576, undefined), 1048576);
+  assert.equal(contextCapacity(1048576, 750000), 750000);
+  assert.equal(contextCapacity(200000, 750000), 200000);
+  // A malformed cap must not blank the window out from under the harness.
+  assert.equal(contextCapacity(1048576, 0), 1048576);
+  assert.equal(contextCapacity(1048576, -5), 1048576);
+  assert.equal(contextCapacity(1048576, Number.NaN), 1048576);
 });
