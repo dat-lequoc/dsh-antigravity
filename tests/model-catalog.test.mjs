@@ -417,3 +417,586 @@ test('contextCapacity only lowers a window and ignores unusable caps', () => {
   assert.equal(contextCapacity(1048576, -5), 1048576);
   assert.equal(contextCapacity(1048576, Number.NaN), 1048576);
 });
+
+test('Gemini 4 Carbon resolves with three reasoning tiers, folds tier aliases, and reads tier quota', async () => {
+  const accountStore = {
+    accountId: 'account-a',
+    path: () => '/tmp/antigravity-oauth.json',
+    read: async () => ({ access: 'token' }),
+  };
+  const modelSettings = {
+    read: async () => ({
+      enabledModelIds: ['gemini-4-carbon-high'],
+      catalogModels: [
+        { id: 'gemini-4-carbon-low', name: 'Gemini 4 Carbon Low' },
+        { id: 'gemini-4-carbon-medium', name: 'Gemini 4 Carbon Medium' },
+        { id: 'gemini-4-carbon-high', name: 'Gemini 4 Carbon High' },
+      ],
+    }),
+    setCatalogModels: async () => {},
+  };
+
+  const adapter = new AntigravityAdapter(accountStore, modelSettings, () => undefined);
+  const carbon = await adapter.resolveModel('antigravity', 'gemini-4-carbon');
+  assert.equal(carbon.name, 'Gemini 4 Carbon');
+  assert.deepEqual(carbon.reasoning?.efforts.map((effort) => effort.id), ['low', 'medium', 'high']);
+  assert.equal(carbon.reasoning?.defaultEffort, 'high');
+  assert.equal(carbon.defaultMaxTokens, 65536);
+
+  const payload = modelOptionsPayload(await modelSettings.read(), {
+    catalogModels: [{ id: 'gemini-4-carbon-high', remainingFraction: 0.72, resetTime: '2026-11-19T00:00:00Z' }],
+  });
+  assert.deepEqual(payload.enabledModelIds, ['gemini-4-carbon']);
+  const carbonOption = payload.options.find((option) => option.id === 'gemini-4-carbon');
+  assert.ok(carbonOption);
+  assert.equal(carbonOption.enabled, true);
+  assert.equal(carbonOption.remainingFraction, 0.72);
+  assert.equal(payload.options.some((option) => option.id.startsWith('gemini-4-carbon-')), false);
+});
+
+test('Gemini 4 Carbon routes to pinned tiers with tier-mapped thinkingBudget and includeThoughts, while Argon sets thinkingLevel', async () => {
+  const accountStore = {
+    async read() { return { access: 'mock-token', projectId: 'mock-project', expires: Date.now() + 3600e3 }; },
+    async capture() { return this; },
+    async modify() { return this.read(); },
+  };
+  const modelSettings = {
+    async read() {
+      return { enabledModelIds: ['gemini-4-carbon', 'gemini-4-argon'], catalogModels: [] };
+    },
+  };
+  const adapter = new AntigravityAdapter(accountStore, modelSettings, () => undefined);
+  const originalFetch = globalThis.fetch;
+  const sent = [];
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('streamGenerateContent')) sent.push(JSON.parse(init.body));
+    return new Response('data: {"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}\n\n', {
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  };
+  try {
+    for (const [effort, expectedModel, expectedBudget] of [
+      ['low', 'gemini-4-carbon-low', 2048],
+      ['medium', 'gemini-4-carbon-medium', 8192],
+      ['high', 'gemini-4-carbon-high', -1],
+      [undefined, 'gemini-4-carbon-high', -1],
+    ]) {
+      sent.length = 0;
+      for await (const _ of adapter.stream({
+        provider: 'antigravity',
+        model: 'gemini-4-carbon',
+        reasoningEffort: effort,
+        system: 'Be concise.',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      })) {}
+      const body = sent.at(-1);
+      assert.equal(body.model, expectedModel);
+      assert.deepEqual(body.request.generationConfig?.thinkingConfig, {
+        thinkingBudget: expectedBudget,
+        includeThoughts: true,
+      });
+      assert.equal(body.request.generationConfig?.maxOutputTokens, undefined);
+      assert.deepEqual(body.request.systemInstruction, {
+        role: 'user',
+        parts: [{ text: 'Be concise.' }],
+      });
+    }
+
+    sent.length = 0;
+    for await (const _ of adapter.stream({
+      provider: 'antigravity',
+      model: 'gemini-4-argon',
+      reasoningEffort: 'high',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    })) {}
+    assert.deepEqual(sent.at(-1).request.generationConfig?.thinkingConfig, {
+      thinkingLevel: 'HIGH',
+      includeThoughts: true,
+    });
+    assert.equal(sent.at(-1).request.systemInstruction, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Gemini multi-turn replay preserves thought:true, drops trailing empty chunks, and keeps user turns separate from functionResponse', async () => {
+  const accountStore = {
+    async read() { return { access: 'mock-token', projectId: 'mock-project', expires: Date.now() + 3600e3 }; },
+    async capture() { return this; },
+    async modify() { return this.read(); },
+  };
+  const modelSettings = {
+    async read() { return { enabledModelIds: ['gemini-4-carbon'], catalogModels: [] }; },
+  };
+  const adapter = new AntigravityAdapter(accountStore, modelSettings, () => undefined);
+  const originalFetch = globalThis.fetch;
+  let capturedBody;
+  let step = 0;
+  globalThis.fetch = async (url, init) => {
+    if (!String(url).includes('streamGenerateContent')) {
+      return new Response('{}', { headers: { 'content-type': 'application/json' } });
+    }
+    step += 1;
+    capturedBody = JSON.parse(init.body);
+    if (step === 1) {
+      const sse = [
+        'data: {"candidates":[{"content":{"role":"model","parts":[{"thought":true,"text":"checking files"}]}}]}',
+        'data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"read_file","args":{"path":"a.js"},"id":"call_1"},"thoughtSignature":"c2lnXzE="}]}}]}',
+        'data: {"candidates":[{"content":{"role":"model","parts":[{"text":""}]},"finishReason":"STOP"}]}',
+        '',
+      ].join('\n');
+      return new Response(sse, { headers: { 'content-type': 'text/event-stream' } });
+    }
+    return new Response('data: {"candidates":[{"content":{"parts":[{"text":"done"}]}}]}\n\n', {
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  };
+  try {
+    const firstChunks = [];
+    for await (const chunk of adapter.stream({
+      provider: 'antigravity',
+      model: 'gemini-4-carbon',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'Read a.js' }] }],
+    })) {
+      firstChunks.push(chunk);
+    }
+    const blockEnds = firstChunks.filter((c) => c.type === 'block-end').map((c) => c.block);
+    // Trailing unsigned empty `{ text: "" }` STOP chunk must not append an empty text block.
+    assert.deepEqual(blockEnds.map((b) => b.type), ['reasoning', 'tool-call']);
+    const finish = firstChunks.find((c) => c.type === 'finish');
+
+    for await (const _ of adapter.stream({
+      provider: 'antigravity',
+      model: 'gemini-4-carbon',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'Read a.js' }] },
+        {
+          role: 'assistant',
+          content: blockEnds,
+          source: {
+            kind: 'model',
+            provider: 'antigravity',
+            model: 'gemini-4-carbon',
+            replayState: finish.replayState,
+          },
+        },
+        { role: 'tool', toolCallId: 'call_1', content: [{ type: 'text', text: 'export const x = 1;' }] },
+        { role: 'user', content: [{ type: 'text', text: 'Now summarize it.' }] },
+        { role: 'assistant', content: [{ type: 'tool-call', id: 'call_2', name: 'stat_file', arguments: '{"path":"a.js"}' }] },
+        { role: 'tool', toolCallId: 'call_2', content: [{ type: 'text', text: '19 bytes' }] },
+      ],
+    })) {}
+
+    assert.deepEqual(capturedBody.request.contents, [
+      { role: 'user', parts: [{ text: 'Read a.js' }] },
+      {
+        role: 'model',
+        parts: [
+          { thought: true, text: 'checking files' },
+          { functionCall: { name: 'read_file', args: { path: 'a.js' } }, thoughtSignature: 'c2lnXzE=' },
+        ],
+      },
+      { role: 'user', parts: [{ functionResponse: { name: 'read_file', response: { output: 'export const x = 1;' } } }] },
+      { role: 'user', parts: [{ text: 'Now summarize it.' }] },
+      {
+        role: 'model',
+        parts: [
+          {
+            functionCall: { name: 'stat_file', args: { path: 'a.js' } },
+            thoughtSignature: 'c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I=',
+          },
+        ],
+      },
+      { role: 'user', parts: [{ functionResponse: { name: 'stat_file', response: { output: '19 bytes' } } }] },
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Gemini 4 Hydrogen resolves four reasoning tiers including xhigh, folds tier aliases, and sends dynamic thinkingBudget (-1) + includeThoughts', async () => {
+  const accountStore = {
+    async read() { return { access: 'mock-token', projectId: 'mock-project', expires: Date.now() + 3600e3 }; },
+    async capture() { return this; },
+    async modify() { return this.read(); },
+  };
+  const modelSettings = {
+    read: async () => ({
+      enabledModelIds: ['gemini-4-hydrogen-xhigh'],
+      catalogModels: [
+        { id: 'gemini-4-hydrogen-low', name: 'Gemini 4 Hydrogen (Low)' },
+        { id: 'gemini-4-hydrogen-medium', name: 'Gemini 4 Hydrogen (Medium)' },
+        { id: 'gemini-4-hydrogen-high', name: 'Gemini 4 Hydrogen (High)' },
+        { id: 'gemini-4-hydrogen-xhigh', name: 'Gemini 4 Hydrogen (XHigh)' },
+      ],
+    }),
+    setCatalogModels: async () => {},
+  };
+
+  const adapter = new AntigravityAdapter(accountStore, modelSettings, () => undefined);
+  const hydrogen = await adapter.resolveModel('antigravity', 'gemini-4-hydrogen');
+  assert.equal(hydrogen.name, 'Gemini 4 Hydrogen');
+  assert.deepEqual(hydrogen.reasoning?.efforts.map((e) => [e.id, e.name]), [
+    ['low', 'Low'],
+    ['medium', 'Medium'],
+    ['high', 'High'],
+    ['xhigh', 'XHigh'],
+  ]);
+  assert.equal(hydrogen.reasoning?.defaultEffort, 'high');
+  assert.equal(hydrogen.defaultMaxTokens, 262144);
+
+  const payload = modelOptionsPayload(await modelSettings.read(), {
+    catalogModels: [{ id: 'gemini-4-hydrogen-xhigh', remainingFraction: 0.85, resetTime: '2026-11-19T00:00:00Z' }],
+  });
+  assert.deepEqual(payload.enabledModelIds, ['gemini-4-hydrogen']);
+  const option = payload.options.find((o) => o.id === 'gemini-4-hydrogen');
+  assert.ok(option);
+  assert.equal(option.enabled, true);
+  assert.equal(option.remainingFraction, 0.85);
+  assert.equal(payload.options.some((o) => o.id.startsWith('gemini-4-hydrogen-')), false);
+
+  const originalFetch = globalThis.fetch;
+  const sent = [];
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('streamGenerateContent')) sent.push(JSON.parse(init.body));
+    return new Response('data: {"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}\n\n', {
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  };
+  try {
+    for (const [effort, expectedModel, expectedBudget] of [
+      ['low', 'gemini-4-hydrogen-low', 2048],
+      ['medium', 'gemini-4-hydrogen-medium', 8192],
+      ['high', 'gemini-4-hydrogen-high', -1],
+      ['xhigh', 'gemini-4-hydrogen-xhigh', -1],
+      [undefined, 'gemini-4-hydrogen-high', -1],
+    ]) {
+      sent.length = 0;
+      for await (const _ of adapter.stream({
+        provider: 'antigravity',
+        model: 'gemini-4-hydrogen',
+        reasoningEffort: effort,
+        maxTokens: 262144,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      })) {}
+      const body = sent.at(-1);
+      assert.equal(body.model, expectedModel, `effort=${String(effort)}`);
+      assert.deepEqual(body.request.generationConfig?.thinkingConfig, {
+        thinkingBudget: expectedBudget,
+        includeThoughts: true,
+      });
+      assert.equal(body.request.generationConfig?.maxOutputTokens, undefined);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Gemini replay keeps past reasoning and encrypted signatures across Gemini model switches, while Claude isolates signatures', async () => {
+  const accountStore = {
+    async read() { return { access: 'mock-token', projectId: 'mock-project', expires: Date.now() + 3600e3 }; },
+    async capture() { return this; },
+    async modify() { return this.read(); },
+  };
+  const modelSettings = {
+    async read() { return { enabledModelIds: ['gemini-4-carbon', 'claude-opus-5.5'], catalogModels: [] }; },
+  };
+  const adapter = new AntigravityAdapter(accountStore, modelSettings, () => undefined);
+  const originalFetch = globalThis.fetch;
+  const sent = [];
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('streamGenerateContent')) sent.push(JSON.parse(init.body));
+    return new Response('data: {"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}\n\n', {
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  };
+  try {
+    const history = [
+      { role: 'user', content: [{ type: 'text', text: 'Analyze step 1' }] },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: 'hydrogen thought' },
+          { type: 'text', text: 'Step 1 done' },
+        ],
+        source: {
+          kind: 'model',
+          provider: 'antigravity',
+          model: 'gemini-4-hydrogen',
+          replayState: {
+            kind: 'antigravity',
+            version: 1,
+            provider: 'antigravity',
+            model: 'gemini-4-hydrogen',
+            blocks: [{ type: 'reasoning' }, { type: 'text', textSignature: 'aHlkcm9fc2ln' }],
+          },
+        },
+      },
+      { role: 'user', content: [{ type: 'text', text: 'Analyze step 2' }] },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: 'legacy thought with no replayState' },
+          { type: 'text', text: 'Step 2 done' },
+        ],
+      },
+      { role: 'user', content: [{ type: 'text', text: 'Continue on Carbon' }] },
+    ];
+
+    for await (const _ of adapter.stream({
+      provider: 'antigravity',
+      model: 'gemini-4-carbon',
+      reasoningEffort: 'high',
+      messages: history,
+    })) {}
+    assert.deepEqual(sent.at(-1).request.contents, [
+      { role: 'user', parts: [{ text: 'Analyze step 1' }] },
+      {
+        role: 'model',
+        parts: [
+          { thought: true, text: 'hydrogen thought' },
+          { text: 'Step 1 done', thoughtSignature: 'aHlkcm9fc2ln' },
+        ],
+      },
+      { role: 'user', parts: [{ text: 'Analyze step 2' }] },
+      {
+        role: 'model',
+        parts: [
+          { thought: true, text: 'legacy thought with no replayState' },
+          { text: 'Step 2 done' },
+        ],
+      },
+      { role: 'user', parts: [{ text: 'Continue on Carbon' }] },
+    ]);
+
+    for await (const _ of adapter.stream({
+      provider: 'antigravity',
+      model: 'claude-opus-5.5',
+      reasoningEffort: 'high',
+      messages: history,
+    })) {}
+    assert.deepEqual(sent.at(-1).request.contents, [
+      { role: 'user', parts: [{ text: 'Analyze step 1' }] },
+      { role: 'model', parts: [{ text: 'Step 1 done' }] },
+      { role: 'user', parts: [{ text: 'Analyze step 2' }] },
+      { role: 'model', parts: [{ text: 'Step 2 done' }] },
+      { role: 'user', parts: [{ text: 'Continue on Carbon' }] },
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('system messages stay in contents[0] with separate user turns on normal sessions, and mirror to systemInstruction above 360k chars', async () => {
+  const accountStore = {
+    async read() { return { access: 'mock-token', projectId: 'mock-project', expires: Date.now() + 3600e3 }; },
+    async capture() { return this; },
+    async modify() { return this.read(); },
+  };
+  const modelSettings = {
+    async read() { return { enabledModelIds: ['gemini-4-carbon'], catalogModels: [] }; },
+  };
+  const adapter = new AntigravityAdapter(accountStore, modelSettings, () => undefined);
+  const originalFetch = globalThis.fetch;
+  const sent = [];
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('streamGenerateContent')) sent.push(JSON.parse(init.body));
+    return new Response('data: {"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}\n\n', {
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  };
+
+  try {
+    for await (const _ of adapter.stream({
+      provider: 'antigravity',
+      model: 'gemini-4-carbon',
+      reasoningEffort: 'high',
+      messages: [
+        { role: 'system', content: [{ type: 'text', text: 'You are a coding agent.\nUse run_code.' }] },
+        { role: 'user', content: [{ type: 'text', text: 'Fix official_eval.py' }] },
+        { role: 'user', content: [{ type: 'text', text: '<system-reminder>Workspace context</system-reminder>' }] },
+      ],
+    })) {}
+
+    const normalReq = sent.at(-1).request;
+    // Below 360k chars, DSH's role:"system" stays strictly in contents[0] (not systemInstruction),
+    // and plain user messages stay separate so short prompts aren't buried inside reminders.
+    assert.equal(normalReq.systemInstruction, undefined);
+    assert.deepEqual(normalReq.contents, [
+      { role: 'user', parts: [{ text: 'You are a coding agent.\nUse run_code.' }] },
+      { role: 'user', parts: [{ text: 'Fix official_eval.py' }] },
+      { role: 'user', parts: [{ text: '<system-reminder>Workspace context</system-reminder>' }] },
+    ]);
+
+    // Above 360k chars, leading role:"system" ALSO mirrors into systemInstruction as a 128k front-trim backup.
+    sent.length = 0;
+    for await (const _ of adapter.stream({
+      provider: 'antigravity',
+      model: 'gemini-4-carbon',
+      reasoningEffort: 'high',
+      system: 'Global header.',
+      messages: [
+        { role: 'system', content: [{ type: 'text', text: 'You are a coding agent.\nUse run_code.' }] },
+        { role: 'user', content: [{ type: 'text', text: 'X'.repeat(370_000) }] },
+      ],
+    })) {}
+    const hugeReq = sent.at(-1).request;
+    assert.deepEqual(hugeReq.systemInstruction, {
+      role: 'user',
+      parts: [{ text: 'Global header.\n\nYou are a coding agent.\nUse run_code.' }],
+    });
+    assert.equal(hugeReq.contents[0].parts[0].text, 'You are a coding agent.\nUse run_code.');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('oversized Gemini tool chains flatten with unescaped string args while keeping normal chains, active tail, and Claude native', async () => {
+  const accountStore = {
+    async read() { return { access: 'mock-token', projectId: 'mock-project', expires: Date.now() + 3600e3 }; },
+    async capture() { return this; },
+    async modify() { return this.read(); },
+  };
+  const modelSettings = {
+    async read() { return { enabledModelIds: ['gemini-4-carbon', 'claude-opus-5.5'], catalogModels: [] }; },
+  };
+  const adapter = new AntigravityAdapter(accountStore, modelSettings, () => undefined);
+  const originalFetch = globalThis.fetch;
+  const sent = [];
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('streamGenerateContent')) sent.push(JSON.parse(init.body));
+    return new Response('data: {"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}\n\n', {
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  };
+
+  const bigOutA = 'A'.repeat(95_000);
+  const bigOutB = 'B'.repeat(95_000);
+
+  try {
+    const historyWithCompletedBigTurn = [
+      { role: 'system', content: [{ type: 'text', text: 'Agent system rules.' }] },
+      // Turn 1: >180k chars across 2 tool steps -> should flatten on Gemini without JSON-escaped quotes!
+      { role: 'user', content: [{ type: 'text', text: 'Inspect big files' }] },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: 'Reading part A' },
+          {
+            type: 'tool-call',
+            id: 'c1',
+            name: 'run_code',
+            arguments: JSON.stringify({
+              description: 'List benchmark directories',
+              code: 'const r = await tools.bash({\n  description: "List benchmark directories"\n});',
+            }),
+          },
+        ],
+      },
+      { role: 'tool', toolCallId: 'c1', content: [{ type: 'text', text: bigOutA }] },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: 'Reading part B' },
+          { type: 'tool-call', id: 'c2', name: 'run_code', arguments: '{"step":2}' },
+        ],
+      },
+      { role: 'tool', toolCallId: 'c2', content: [{ type: 'text', text: bigOutB }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'Inspection complete.' }] },
+      // Turn 2: medium completed turn (<180k chars) -> stays native FC/FR!
+      { role: 'user', content: [{ type: 'text', text: 'Quick check' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'c3', name: 'run_code', arguments: '{"step":3}' }] },
+      { role: 'tool', toolCallId: 'c3', content: [{ type: 'text', text: 'C'.repeat(90_000) }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'Quick check done.' }] },
+      // Turn 3: active turn with in-flight tool call -> stays native FC/FR with thoughtSignature
+      { role: 'user', content: [{ type: 'text', text: 'Apply fix now' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'c4', name: 'run_code', arguments: '{"step":4}' }] },
+      { role: 'tool', toolCallId: 'c4', content: [{ type: 'text', text: 'patched' }] },
+    ];
+
+    for await (const _ of adapter.stream({
+      provider: 'antigravity',
+      model: 'gemini-4-carbon',
+      reasoningEffort: 'high',
+      messages: historyWithCompletedBigTurn,
+    })) {}
+
+    const geminiContents = sent.at(-1).request.contents;
+    // contents[0] is system, contents[1] is Turn 1 user, contents[2] is flattened Turn 1 model
+    assert.equal(geminiContents[0].parts[0].text, 'Agent system rules.');
+    assert.equal(geminiContents[1].parts[0].text, 'Inspect big files');
+    assert.deepEqual(geminiContents[2], {
+      role: 'model',
+      parts: [
+        { thought: true, text: 'Reading part A' },
+        {
+          text:
+            '[Completed tool call: run_code]\n' +
+            'description: List benchmark directories\n' +
+            'code:\n' +
+            'const r = await tools.bash({\n  description: "List benchmark directories"\n});',
+        },
+      ],
+    });
+    assert.equal(geminiContents[2].parts[1].text.includes('\\"'), false);
+    assert.equal(geminiContents[3].role, 'user');
+    assert.equal('functionResponse' in geminiContents[3].parts[0], false);
+    assert.match(geminiContents[3].parts[0].text, /^\[Completed tool output: run_code\]\nA+$/);
+    assert.equal('functionResponse' in geminiContents[5].parts[0], false);
+
+    // Turn 2 (90k < 180k) remains native functionCall / functionResponse
+    assert.deepEqual(geminiContents[8].parts[0].functionCall, { name: 'run_code', args: { step: 3 } });
+    assert.equal('functionResponse' in geminiContents[9].parts[0], true);
+
+    // Turn 3 (active) remains native functionCall / functionResponse with fallback thoughtSignature
+    assert.deepEqual(geminiContents[12].parts[0], {
+      functionCall: { name: 'run_code', args: { step: 4 } },
+      thoughtSignature: 'c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I=',
+    });
+    assert.deepEqual(geminiContents[13].parts[0].functionResponse, {
+      name: 'run_code',
+      response: { output: 'patched' },
+    });
+
+    // Claude keeps all turns as native functionCall / functionResponse
+    sent.length = 0;
+    for await (const _ of adapter.stream({
+      provider: 'antigravity',
+      model: 'claude-opus-5.5',
+      messages: historyWithCompletedBigTurn,
+    })) {}
+    const claudeContents = sent.at(-1).request.contents;
+    assert.equal('functionCall' in claudeContents[2].parts[0], true);
+    assert.equal('functionResponse' in claudeContents[3].parts[0], true);
+
+    // Marathon active Gemini turn (>320k chars) flattens older steps while preserving native tail
+    const marathonMsgs = [{ role: 'user', content: [{ type: 'text', text: 'Start marathon' }] }];
+    for (let k = 1; k <= 8; k++) {
+      marathonMsgs.push({
+        role: 'assistant',
+        content: [{ type: 'tool-call', id: `m_${k}`, name: 'run_code', arguments: JSON.stringify({ k }) }],
+      });
+      marathonMsgs.push({
+        role: 'tool',
+        toolCallId: `m_${k}`,
+        content: [{ type: 'text', text: String(k).repeat(50_000) }],
+      });
+    }
+    sent.length = 0;
+    for await (const _ of adapter.stream({
+      provider: 'antigravity',
+      model: 'gemini-4-carbon',
+      messages: marathonMsgs,
+    })) {}
+    const marathonContents = sent.at(-1).request.contents;
+    assert.equal('functionCall' in marathonContents[1].parts[0], false);
+    assert.equal('functionResponse' in marathonContents[2].parts[0], false);
+    const tailModel = marathonContents.at(-2);
+    const tailTool = marathonContents.at(-1);
+    assert.equal('functionCall' in tailModel.parts[0], true);
+    assert.equal(tailModel.parts[0].thoughtSignature, 'c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I=');
+    assert.equal('functionResponse' in tailTool.parts[0], true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
