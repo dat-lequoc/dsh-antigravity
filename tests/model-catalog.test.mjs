@@ -1000,3 +1000,94 @@ test('oversized Gemini tool chains flatten with unescaped string args while keep
     globalThis.fetch = originalFetch;
   }
 });
+
+test('sandbox endpoint is preferred first, 503 fails fast as SERVER over secondary 404, and streamIdleTimeoutMs aborts hung streams', async () => {
+  const accountStore = {
+    async read() { return { access: 'mock-token', projectId: 'mock-project', expires: Date.now() + 3600e3 }; },
+    async capture() { return this; },
+    async modify() { return this.read(); },
+  };
+  const modelSettings = {
+    async read() { return { enabledModelIds: ['gemini-4-carbon'], catalogModels: [] }; },
+  };
+  const originalFetch = globalThis.fetch;
+  const calledHosts = [];
+
+  try {
+    // 1. Sandbox endpoint succeeds on first try without hitting cloudcode-pa.googleapis.com
+    globalThis.fetch = async (url) => {
+      calledHosts.push(new URL(String(url)).host);
+      return new Response('data: {"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}\n\n', {
+        headers: { 'content-type': 'text/event-stream' },
+      });
+    };
+    const adapter = new AntigravityAdapter(accountStore, modelSettings, () => undefined);
+    for await (const _ of adapter.stream({
+      provider: 'antigravity',
+      model: 'gemini-4-carbon',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    })) {}
+    assert.deepEqual(calledHosts, ['daily-cloudcode-pa.sandbox.googleapis.com']);
+
+    // 2. Sandbox 503 + secondary 404 fails fast (<1s, no 60s sleep) and preserves code="SERVER"
+    calledHosts.length = 0;
+    globalThis.fetch = async (url) => {
+      const host = new URL(String(url)).host;
+      calledHosts.push(host);
+      if (host.includes('sandbox')) {
+        return new Response('{"error":{"code":503,"message":"Model is at capacity"}}', { status: 503 });
+      }
+      return new Response('{"error":{"code":404,"message":"Requested entity was not found"}}', { status: 404 });
+    };
+    const t0 = Date.now();
+    await assert.rejects(
+      async () => {
+        for await (const _ of adapter.stream({
+          provider: 'antigravity',
+          model: 'gemini-4-carbon',
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+        })) {}
+      },
+      (err) => {
+        assert.equal(err.code, 'SERVER');
+        assert.match(err.message, /503/);
+        assert.ok(Date.now() - t0 < 2000, 'must fail fast without sleeping 60s');
+        return true;
+      },
+    );
+    assert.deepEqual(calledHosts, ['daily-cloudcode-pa.sandbox.googleapis.com', 'cloudcode-pa.googleapis.com']);
+
+    // 3. Hung stream aborts cleanly with code="TIMEOUT" at configured streamIdleTimeoutMs
+    globalThis.fetch = async (_url, init) => new Promise((_, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        reject(new DOMException('Aborted', 'AbortError'));
+      }, { once: true });
+    });
+    const fastTimeoutAdapter = new AntigravityAdapter(
+      accountStore,
+      modelSettings,
+      () => undefined,
+      undefined,
+      { streamIdleTimeoutMs: 1000 },
+    );
+    const t1 = Date.now();
+    await assert.rejects(
+      async () => {
+        for await (const _ of fastTimeoutAdapter.stream({
+          provider: 'antigravity',
+          model: 'gemini-4-carbon',
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+        })) {}
+      },
+      (err) => {
+        assert.equal(err.code, 'TIMEOUT');
+        assert.match(err.message, /idle timeout after 1000ms/);
+        const elapsed = Date.now() - t1;
+        assert.ok(elapsed >= 900 && elapsed < 3000, `expected ~1s timeout, got ${elapsed}ms`);
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
