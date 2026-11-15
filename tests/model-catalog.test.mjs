@@ -787,7 +787,7 @@ test('Gemini replay keeps past reasoning and encrypted signatures across Gemini 
   }
 });
 
-test('system messages stay in contents[0] with separate user turns on normal sessions, and mirror to systemInstruction above 360k chars', async () => {
+test('system messages stay strictly in contents[0] with separate user turns even above 360k chars so sandbox systemInstruction 429 filters never fire', async () => {
   const accountStore = {
     async read() { return { access: 'mock-token', projectId: 'mock-project', expires: Date.now() + 3600e3 }; },
     async capture() { return this; },
@@ -812,40 +812,35 @@ test('system messages stay in contents[0] with separate user turns on normal ses
       model: 'gemini-4-carbon',
       reasoningEffort: 'high',
       messages: [
-        { role: 'system', content: [{ type: 'text', text: 'You are a coding agent.\nUse run_code.' }] },
+        { role: 'system', content: [{ type: 'text', text: 'You are an AI agent powered by DeepSeek Harness.' }] },
         { role: 'user', content: [{ type: 'text', text: 'Fix official_eval.py' }] },
         { role: 'user', content: [{ type: 'text', text: '<system-reminder>Workspace context</system-reminder>' }] },
       ],
     })) {}
 
     const normalReq = sent.at(-1).request;
-    // Below 360k chars, DSH's role:"system" stays strictly in contents[0] (not systemInstruction),
-    // and plain user messages stay separate so short prompts aren't buried inside reminders.
     assert.equal(normalReq.systemInstruction, undefined);
     assert.deepEqual(normalReq.contents, [
-      { role: 'user', parts: [{ text: 'You are a coding agent.\nUse run_code.' }] },
+      { role: 'user', parts: [{ text: 'You are an AI agent powered by DeepSeek Harness.' }] },
       { role: 'user', parts: [{ text: 'Fix official_eval.py' }] },
       { role: 'user', parts: [{ text: '<system-reminder>Workspace context</system-reminder>' }] },
     ]);
 
-    // Above 360k chars, leading role:"system" ALSO mirrors into systemInstruction as a 128k front-trim backup.
+    // Even above 360k chars, role:"system" must NEVER be copied into systemInstruction
+    // (which triggers HTTP 429 on "You are an AI agent powered by DeepSeek Harness.").
     sent.length = 0;
     for await (const _ of adapter.stream({
       provider: 'antigravity',
       model: 'gemini-4-carbon',
       reasoningEffort: 'high',
-      system: 'Global header.',
       messages: [
-        { role: 'system', content: [{ type: 'text', text: 'You are a coding agent.\nUse run_code.' }] },
+        { role: 'system', content: [{ type: 'text', text: 'You are an AI agent powered by DeepSeek Harness.' }] },
         { role: 'user', content: [{ type: 'text', text: 'X'.repeat(370_000) }] },
       ],
     })) {}
     const hugeReq = sent.at(-1).request;
-    assert.deepEqual(hugeReq.systemInstruction, {
-      role: 'user',
-      parts: [{ text: 'Global header.\n\nYou are a coding agent.\nUse run_code.' }],
-    });
-    assert.equal(hugeReq.contents[0].parts[0].text, 'You are a coding agent.\nUse run_code.');
+    assert.equal(hugeReq.systemInstruction, undefined);
+    assert.equal(hugeReq.contents[0].parts[0].text, 'You are an AI agent powered by DeepSeek Harness.');
   } finally {
     globalThis.fetch = originalFetch;
   }
